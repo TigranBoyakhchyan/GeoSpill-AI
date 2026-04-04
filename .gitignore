@@ -1,0 +1,11 @@
+.venv/
+__pycache__/
+*.pyc
+FullDataset/
+LocalTrainingDataset/
+checkpoints/
+*.tif
+*.tiff
+*.pth
+*.egg-info/
+.DS_Store
