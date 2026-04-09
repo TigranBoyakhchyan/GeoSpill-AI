@@ -23,10 +23,10 @@ warnings.filterwarnings("ignore", category=NotGeoreferencedWarning)
 
 # ─── CONFIG ───────────────────────────────────────────────────────────────────
 # Adjust these paths if needed
-IMAGES_DIR   = "../LocalTrainingDataset/Image"   # local subset for now
-MASKS_DIR    = "../LocalTrainingDataset/Mask"
-OUTPUT_DIR   = "../data/patches"                  # where patches will be saved
-STATS_FILE   = "../data/train_stats.json"         # mean/std saved here
+IMAGES_DIR   = "LocalTrainingDataset/Image"   # local subset for now
+MASKS_DIR    = "LocalTrainingDataset/Mask"
+OUTPUT_DIR   = "data/patches"                  # where patches will be saved
+STATS_FILE   = "data/train_stats.json"         # mean/std saved here
 
 PATCH_SIZE   = 256    # width and height of each patch in pixels
 STRIDE       = 256    # how many pixels to move between patches

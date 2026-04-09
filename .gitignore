@@ -4,6 +4,9 @@ __pycache__/
 FullDataset/
 LocalTrainingDataset/
 checkpoints/
+eda.py
+eda_output/
+data/patches/
 *.tif
 *.tiff
 *.pth
