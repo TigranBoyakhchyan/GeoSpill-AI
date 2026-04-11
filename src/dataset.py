@@ -1,17 +1,19 @@
 """
 src/dataset.py
 --------------
-PyTorch Dataset and DataLoader for the SAR oil spill segmentation task.
+PyTorch Dataset that loads raw SAR GeoTIFF files and crops patches
+on-the-fly during training. No pre-extracted patches needed.
 
-This file:
-    1. Defines OilSpillDataset — loads pre-processed .npy patches from disk
-    2. Applies data augmentation during training
-    3. Provides a get_dataloaders() helper that returns ready-to-use loaders
+Each call to __getitem__:
+    1. Loads the full 2048x2048 SAR image and mask from disk
+    2. Clips and normalizes the image
+    3. Applies a random 256x256 crop + augmentations
+    4. Returns a (image, mask) tensor pair
 
-Assumes preprocess.py has already been run and patches exist at:
-    data/patches/train/
-    data/patches/val/
-    data/patches/test/
+This uses more CPU per batch than loading pre-saved patches, but:
+    - Zero extra disk space (raw files stay as-is)
+    - Each epoch sees different random crops -> better generalization
+    - Works directly from Google Drive on Colab
 
 Usage:
     from src.dataset import get_dataloaders
@@ -23,254 +25,267 @@ import json
 import numpy as np
 import torch
 from torch.utils.data import Dataset, DataLoader
+import rasterio
 import albumentations as A
 from albumentations.pytorch import ToTensorV2
+import warnings
+import logging
+
+from rasterio.errors import NotGeoreferencedWarning
+warnings.filterwarnings("ignore", category=NotGeoreferencedWarning)
+logging.getLogger("rasterio").setLevel(logging.ERROR)
 
 # ─── CONFIG ───────────────────────────────────────────────────────────────────
-PATCHES_DIR = "data/patches"     # root folder containing train/ val/ test/
 STATS_FILE  = "data/train_stats.json"
+SPLITS_FILE = "data/splits.json"
 
 PATCH_SIZE  = 256
-BATCH_SIZE  = 8     # reduce to 4 if you run out of memory locally
-NUM_WORKERS = 0     # IMPORTANT: keep 0 on Windows to avoid DataLoader errors
-                    # change to 4 on Linux / Google Colab for faster loading
-PIN_MEMORY  = False # set True only when training on GPU
+BATCH_SIZE  = 8
+NUM_WORKERS = 0      # keep 0 on Windows; set 4 on Colab (Linux)
+PIN_MEMORY  = False  # set True when training on GPU
 
 
-# ─── STEP 1: DATASET CLASS ────────────────────────────────────────────────────
+# ─── DATASET CLASS ────────────────────────────────────────────────────────────
 
 class OilSpillDataset(Dataset):
     """
-    PyTorch Dataset that loads pre-processed SAR patches from disk.
+    Loads full SAR images from disk and crops random patches on-the-fly.
 
-    Each sample is a pair of:
-        image: float32 tensor of shape (2, 256, 256)  — 2 bands (VV, VH)
-        mask:  float32 tensor of shape (1, 256, 256)  — binary oil mask
+    Why on-the-fly instead of pre-saved patches?
+        Pre-saving 1200 images worth of patches at stride=128 produces
+        ~135GB of data. On-the-fly cropping uses zero extra disk space
+        because we just read the original files and crop in memory.
 
-    The patches were already normalized in preprocess.py so we only
-    need to load them and optionally apply augmentation here.
+    Each image is used multiple times per epoch via random crops.
+    The number of crops per image is controlled by crops_per_image.
 
     Args:
-        split:     one of "train", "val", "test"
-        transform: albumentations transform pipeline (None for val/test)
+        image_paths:     list of full paths to SAR .tif images
+        mask_paths:      corresponding list of mask .tif paths
+        mean:            per-band mean for normalization, shape (2,)
+        std:             per-band std for normalization, shape (2,)
+        transform:       albumentations pipeline (includes RandomCrop)
+        crops_per_image: how many random crops to take per image per epoch
+                         (higher = more samples but slower epoch)
     """
 
-    def __init__(self, split: str, transform=None):
-        self.split     = split
-        self.transform = transform
-        self.patch_dir = os.path.join(PATCHES_DIR, split)
+    def __init__(self,
+                 image_paths:     list,
+                 mask_paths:      list,
+                 mean:            np.ndarray,
+                 std:             np.ndarray,
+                 transform=None,
+                 crops_per_image: int = 5):
 
-        if not os.path.exists(self.patch_dir):
-            raise FileNotFoundError(
-                f"Patch directory not found: {self.patch_dir}\n"
-                f"Did you run src/preprocess.py first?"
-            )
+        self.image_paths     = image_paths
+        self.mask_paths      = mask_paths
+        self.mean            = mean[:, None, None].astype(np.float32)  # (2,1,1)
+        self.std             = std[:, None, None].astype(np.float32)
+        self.transform       = transform
+        self.crops_per_image = crops_per_image
 
-        # Collect all image patch indices by scanning for *_img.npy files.
-        # We store just the indices (e.g. 0, 1, 2 ...) and build paths on the fly.
-        # This avoids loading everything into RAM at once.
-        self.indices = sorted([
-            int(f.replace("_img.npy", ""))
-            for f in os.listdir(self.patch_dir)
-            if f.endswith("_img.npy")
-        ])
+        # Each image appears crops_per_image times in the index
+        # index 0..crops_per_image-1 all map to image 0
+        # index crops_per_image..2*crops_per_image-1 map to image 1, etc.
+        self.total = len(image_paths) * crops_per_image
 
-        if len(self.indices) == 0:
-            raise RuntimeError(f"No patches found in {self.patch_dir}")
-
-        print(f"  [{split}] Loaded {len(self.indices)} patches from {self.patch_dir}")
+        print(f"  Dataset: {len(image_paths)} images × "
+              f"{crops_per_image} crops = {self.total} samples per epoch")
 
     def __len__(self) -> int:
-        # tells PyTorch how many samples are in this dataset
-        return len(self.indices)
+        return self.total
+
+    def _load_and_normalize(self, img_path: str) -> np.ndarray:
+        """Load a SAR image, clip dB values, and z-score normalize."""
+        with rasterio.open(img_path) as src:
+            img = src.read().astype(np.float32)   # (2, H, W)
+        img = np.clip(img, -50.0, 0.0)
+        img = (img - self.mean) / (self.std + 1e-6)
+        return img
+
+    def _load_mask(self, mask_path: str) -> np.ndarray:
+        """Load binary mask, normalize to 0.0/1.0."""
+        with rasterio.open(mask_path) as src:
+            mask = src.read(1).astype(np.float32)  # (H, W)
+        if mask.max() > 1.0:
+            mask = (mask > 127).astype(np.float32)
+        return mask
 
     def __getitem__(self, idx: int) -> tuple:
         """
-        Load one (image, mask) pair by index.
+        Load one (image, mask) crop.
 
-        __getitem__ is called by the DataLoader for each sample in a batch.
-        It must return tensors, not numpy arrays.
-
-        Flow:
-            1. Load .npy files from disk
-            2. Optionally apply augmentation
-            3. Convert to PyTorch tensors
-            4. Add channel dim to mask: (H, W) → (1, H, W)
-
-        Args:
-            idx: position in self.indices list (not the patch filename number)
-
-        Returns:
-            image: tensor (2, 256, 256)
-            mask:  tensor (1, 256, 256)
+        Maps flat index → image index via integer division,
+        then applies a random crop (different every call due to
+        albumentations' internal randomness).
         """
-        patch_idx = self.indices[idx]
+        # Map flat idx to image idx
+        img_idx = idx % len(self.image_paths)
 
-        # Load pre-processed numpy arrays from disk
-        img  = np.load(os.path.join(self.patch_dir, f"{patch_idx:05d}_img.npy"))   # (2, H, W)
-        mask = np.load(os.path.join(self.patch_dir, f"{patch_idx:05d}_mask.npy"))  # (H, W)
+        try:
+            img  = self._load_and_normalize(self.image_paths[img_idx])
+            mask = self._load_mask(self.mask_paths[img_idx])
+        except Exception as e:
+            # If a file is corrupted, return a zero patch and continue
+            img  = np.zeros((2, PATCH_SIZE, PATCH_SIZE), dtype=np.float32)
+            mask = np.zeros((PATCH_SIZE, PATCH_SIZE), dtype=np.float32)
+            print(f"\n  Warning: skipping corrupted file "
+                  f"{os.path.basename(self.image_paths[img_idx])}: {e}")
+            return torch.from_numpy(img), torch.zeros(1, PATCH_SIZE, PATCH_SIZE)
 
         if self.transform:
-            # Albumentations expects images in (H, W, C) format — opposite of PyTorch.
-            # We temporarily transpose from (2, H, W) → (H, W, 2) for augmentation,
-            # then ToTensorV2 converts back to (2, H, W) automatically.
-            img_hwc = img.transpose(1, 2, 0).astype(np.float32)   # (H, W, 2), ensure float32
-
+            # Albumentations expects (H, W, C) — transpose from (C, H, W)
+            img_hwc   = img.transpose(1, 2, 0).astype(np.float32)
             augmented = self.transform(image=img_hwc, mask=mask)
-
-            img  = augmented["image"]   # ToTensorV2 → tensor (2, H, W)
-            mask = augmented["mask"]    # still (H, W) — we add channel dim below
+            img  = augmented["image"]        # tensor (2, H, W) via ToTensorV2
+            mask = augmented["mask"]         # tensor (H, W)
         else:
-            # No augmentation — just convert to tensors manually
-            img  = torch.from_numpy(img)           # (2, H, W)
-            mask = torch.from_numpy(mask)          # (H, W)
+            img  = torch.from_numpy(img)
+            mask = torch.from_numpy(mask)
 
-        # Add channel dimension to mask: (H, W) → (1, H, W)
-        # This matches the model output shape and loss function expectations
+        # Add channel dim to mask: (H, W) -> (1, H, W)
         mask = mask.unsqueeze(0)
-
         return img, mask
 
 
-# ─── STEP 2: AUGMENTATION PIPELINES ──────────────────────────────────────────
+# ─── AUGMENTATION PIPELINES ───────────────────────────────────────────────────
 
-def get_train_transform() -> A.Compose:
+def get_train_transform(patch_size: int = PATCH_SIZE) -> A.Compose:
     """
-    Augmentation pipeline for TRAINING only.
+    Training augmentation with random crop.
 
-    Goal: artificially increase dataset diversity so the model generalizes
-    better and doesn't memorize the 46 training images.
-
-    Rules for SAR augmentation:
-        ✅ Geometric transforms (flip, rotate) — physically valid for SAR
-        ✅ Slight blur — simulates speckle variation
-        ✅ Gaussian noise — simulates sensor noise
-        ❌ Color jitter / hue / saturation — SAR has no color, meaningless
-        ❌ CLAHE / brightness — changes physical backscatter meaning
-
-    Every transform is applied with a probability (p=...).
-    The same transform is applied to BOTH image and mask automatically
-    by albumentations — so the mask stays aligned with the image.
+    RandomCrop is the key addition vs the old patch-based approach.
+    It picks a random 256x256 region from the full 2048x2048 image,
+    so each call to __getitem__ sees a different region.
     """
     return A.Compose([
-        # Random horizontal flip — oil spills have no preferred orientation
+        # Random crop — this replaces pre-extracted patches
+        A.RandomCrop(patch_size, patch_size),
+
+        # Geometric augmentations — valid for SAR (no preferred orientation)
         A.HorizontalFlip(p=0.5),
-
-        # Random vertical flip — same reasoning
         A.VerticalFlip(p=0.5),
-
-        # Random 90° rotation — SAR geometry is rotation-invariant
         A.RandomRotate90(p=0.5),
 
-        # Slight Gaussian blur — simulates speckle smoothing variation
-        # blur_limit controls kernel size range (must be odd numbers)
+        # Noise — simulates SAR speckle variation
         A.GaussianBlur(blur_limit=(3, 5), p=0.3),
-
-        # Gaussian noise — simulates SAR thermal noise variation
         A.GaussNoise(noise_scale_factor=0.02, p=0.3),
 
-        # Convert numpy (H, W, C) → PyTorch tensor (C, H, W)
-        # Also converts dtype to float32 if not already
         ToTensorV2(),
     ])
 
 
-def get_val_transform() -> A.Compose:
+def get_val_transform(patch_size: int = PATCH_SIZE) -> A.Compose:
     """
-    Transform pipeline for VALIDATION and TEST sets.
+    Validation/test: fixed center crop, no augmentation.
 
-    No augmentation — we want to evaluate on clean, unmodified patches
-    so metrics reflect true model performance.
-
-    We still need ToTensorV2 to convert numpy → tensor.
+    CenterCrop instead of RandomCrop for reproducible evaluation —
+    the same region is evaluated every epoch so val metrics are comparable.
     """
     return A.Compose([
+        A.CenterCrop(patch_size, patch_size),
         ToTensorV2(),
     ])
 
 
-# ─── STEP 3: DATALOADER FACTORY ───────────────────────────────────────────────
+# ─── DATALOADER FACTORY ───────────────────────────────────────────────────────
 
 def get_dataloaders(
-    batch_size:  int  = BATCH_SIZE,
-    num_workers: int  = NUM_WORKERS,
-    pin_memory:  bool = PIN_MEMORY,
+    stats_file:      str  = STATS_FILE,
+    splits_file:     str  = SPLITS_FILE,
+    batch_size:      int  = BATCH_SIZE,
+    num_workers:     int  = NUM_WORKERS,
+    pin_memory:      bool = PIN_MEMORY,
+    crops_per_image: int  = 5,
 ) -> tuple:
     """
-    Create and return train, val, and test DataLoaders.
+    Build train, val, test DataLoaders from splits.json and train_stats.json.
 
-    The DataLoader wraps the Dataset and handles:
-        - Batching: groups samples into batches of size batch_size
-        - Shuffling: randomizes order each epoch (train only)
-        - Parallel loading: uses multiple CPU workers (num_workers)
-        - GPU transfer: pin_memory speeds up CPU→GPU data transfer
+    crops_per_image controls how many random crops per image per epoch:
+        - 5  → 46 images × 5 = 230 samples locally (fast, good for testing)
+        - 10 → 1200 images × 10 = 12,000 samples on Colab (good for training)
 
     Args:
-        batch_size:  number of patches per batch
-        num_workers: parallel loading workers (0 = main process, safe on Windows)
-        pin_memory:  faster GPU transfer (True only when using CUDA)
+        stats_file:      path to train_stats.json
+        splits_file:     path to splits.json
+        batch_size:      samples per batch
+        num_workers:     parallel loading workers (0 on Windows)
+        pin_memory:      faster GPU transfer (True when using CUDA)
+        crops_per_image: random crops per image per epoch
 
     Returns:
         train_loader, val_loader, test_loader
     """
+    # Load normalization stats
+    if not os.path.exists(stats_file):
+        raise FileNotFoundError(
+            f"Stats file not found: {stats_file}\n"
+            "Run src/preprocess.py first."
+        )
+    with open(stats_file) as f:
+        stats = json.load(f)
+    mean = np.array(stats["mean"], dtype=np.float32)
+    std  = np.array(stats["std"],  dtype=np.float32)
+
+    # Load splits
+    if not os.path.exists(splits_file):
+        raise FileNotFoundError(
+            f"Splits file not found: {splits_file}\n"
+            "Run src/preprocess.py first."
+        )
+    with open(splits_file) as f:
+        splits = json.load(f)
+
+    mask_map = splits["masks"]   # image_path -> mask_path
+
     print("\nInitializing datasets...")
+    loaders = {}
+    for split in ["train", "val", "test"]:
+        img_paths  = splits[split]
+        mask_paths = [mask_map[p] for p in img_paths]
 
-    train_dataset = OilSpillDataset(split="train", transform=get_train_transform())
-    val_dataset   = OilSpillDataset(split="val",   transform=get_val_transform())
-    test_dataset  = OilSpillDataset(split="test",  transform=get_val_transform())
+        transform = (get_train_transform() if split == "train"
+                     else get_val_transform())
 
-    train_loader = DataLoader(
-        train_dataset,
-        batch_size=batch_size,
-        shuffle=True,       # shuffle every epoch so batches are different each time
-        num_workers=num_workers,
-        pin_memory=pin_memory,
-        drop_last=True,     # drop the last incomplete batch to avoid batch norm issues
-    )
+        # Val/test: 1 crop per image is enough for evaluation
+        n_crops = crops_per_image if split == "train" else 1
 
-    val_loader = DataLoader(
-        val_dataset,
-        batch_size=batch_size,
-        shuffle=False,      # no shuffle for val/test — order doesn't matter for evaluation
-        num_workers=num_workers,
-        pin_memory=pin_memory,
-        drop_last=False,    # keep all val/test samples for accurate metrics
-    )
+        dataset = OilSpillDataset(
+            image_paths     = img_paths,
+            mask_paths      = mask_paths,
+            mean            = mean,
+            std             = std,
+            transform       = transform,
+            crops_per_image = n_crops,
+        )
 
-    test_loader = DataLoader(
-        test_dataset,
-        batch_size=batch_size,
-        shuffle=False,
-        num_workers=num_workers,
-        pin_memory=pin_memory,
-        drop_last=False,
-    )
+        loaders[split] = DataLoader(
+            dataset,
+            batch_size  = batch_size,
+            shuffle     = (split == "train"),
+            num_workers = num_workers,
+            pin_memory  = pin_memory,
+            drop_last   = (split == "train"),
+        )
 
     print(f"\n  Batch size  : {batch_size}")
     print(f"  num_workers : {num_workers}")
-    print(f"  pin_memory  : {pin_memory}")
-    print(f"\n  Train batches : {len(train_loader)}")
-    print(f"  Val batches   : {len(val_loader)}")
-    print(f"  Test batches  : {len(test_loader)}")
+    print(f"  Train batches : {len(loaders['train'])}")
+    print(f"  Val batches   : {len(loaders['val'])}")
+    print(f"  Test batches  : {len(loaders['test'])}")
 
-    return train_loader, val_loader, test_loader
+    return loaders["train"], loaders["val"], loaders["test"]
 
 
-# ─── STEP 4: SANITY CHECK ─────────────────────────────────────────────────────
+# ─── SANITY CHECK ─────────────────────────────────────────────────────────────
 
 def run_sanity_check():
     """
-    Quick sanity check — run this after preprocess.py to verify everything works.
-
-    Checks:
-        - Patches load without errors
-        - Tensor shapes are correct
-        - Value ranges look reasonable after normalization
-        - Mask contains only 0s and 1s
-
-    Run with:
-        python src/dataset.py
+    Verify the dataset loads correctly and tensors have the right shape.
+    Run with: python src/dataset.py
     """
+    import matplotlib
+    matplotlib.use("Agg")
     import matplotlib.pyplot as plt
 
     print("=" * 60)
@@ -279,7 +294,6 @@ def run_sanity_check():
 
     train_loader, val_loader, test_loader = get_dataloaders(batch_size=4)
 
-    # Grab one batch from train loader
     images, masks = next(iter(train_loader))
 
     print(f"\nBatch shapes:")
@@ -290,43 +304,31 @@ def run_sanity_check():
     print(f"  max  : {images.max():.4f}")
     print(f"  mean : {images.mean():.4f}  (should be close to 0)")
     print(f"  std  : {images.std():.4f}   (should be close to 1)")
-    print(f"\nMask stats:")
-    print(f"  unique values : {masks.unique().tolist()}  (should be [0.0, 1.0])")
-    print(f"  oil pixels    : {masks.sum().item():.0f} / {masks.numel()}")
-    print(f"  oil coverage  : {100 * masks.mean().item():.2f}%")
+    print(f"\nMask unique values: {masks.unique().tolist()}  (should be [0.0, 1.0])")
+    print(f"Oil coverage: {100 * masks.mean().item():.2f}%")
 
-    # Visual check — plot 4 samples from the batch
+    # Save a quick visual
+    os.makedirs("eda_output", exist_ok=True)
     fig, axes = plt.subplots(4, 3, figsize=(12, 16))
-    fig.suptitle("Sanity Check — Training Batch Samples", fontsize=14, fontweight="bold")
-
-    for i in range(4):
-        img  = images[i]   # (2, H, W)
-        mask = masks[i]    # (1, H, W)
-
-        vv_band = img[0].numpy()   # VV polarization
-        vh_band = img[1].numpy()   # VH polarization
-        msk     = mask[0].numpy()  # binary mask
-
-        axes[i][0].imshow(vv_band, cmap="gray")
-        axes[i][0].set_title(f"Sample {i+1} — VV band", fontsize=9)
+    fig.suptitle("Dataset Sanity Check — On-the-fly Crops", fontsize=13)
+    for i in range(min(4, images.shape[0])):
+        axes[i][0].imshow(images[i][0].numpy(), cmap="gray")
+        axes[i][0].set_title(f"VV band (sample {i+1})", fontsize=8)
         axes[i][0].axis("off")
-
-        axes[i][1].imshow(vh_band, cmap="gray")
-        axes[i][1].set_title(f"Sample {i+1} — VH band", fontsize=9)
+        axes[i][1].imshow(images[i][1].numpy(), cmap="gray")
+        axes[i][1].set_title(f"VH band (sample {i+1})", fontsize=8)
         axes[i][1].axis("off")
-
-        axes[i][2].imshow(msk, cmap="gray", vmin=0, vmax=1)
-        oil_pct = 100 * msk.mean()
-        axes[i][2].set_title(f"Sample {i+1} — Mask ({oil_pct:.1f}% oil)", fontsize=9)
+        axes[i][2].imshow(masks[i][0].numpy(), cmap="gray", vmin=0, vmax=1)
+        oil_pct = 100 * masks[i].mean().item()
+        axes[i][2].set_title(f"Mask ({oil_pct:.1f}% oil)", fontsize=8)
         axes[i][2].axis("off")
 
     plt.tight_layout()
-    os.makedirs("eda_output", exist_ok=True)
     out = "eda_output/dataset_sanity_check.png"
     plt.savefig(out, dpi=120, bbox_inches="tight")
     plt.close()
     print(f"\nSanity check plot saved: {out}")
-    print("\nDataset looks good — ready to build the model.")
+    print("\nDataset working correctly.")
 
 
 if __name__ == "__main__":
