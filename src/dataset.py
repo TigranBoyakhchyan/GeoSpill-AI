@@ -96,7 +96,14 @@ class OilSpillDataset(Dataset):
         return self.total
 
     def _load_and_normalize(self, img_path: str) -> np.ndarray:
-        """Load a SAR image, clip dB values, and z-score normalize."""
+        """
+        Load a SAR image and return normalized float32 array.
+        - .npy files: already clipped and normalized by preprocessing notebook, load directly
+        - .tif files: clip and normalize on the fly (fallback for local training)
+        """
+        if img_path.endswith('.npy'):
+            return np.load(img_path)   # already normalized, shape (2, H, W)
+
         with rasterio.open(img_path) as src:
             img = src.read().astype(np.float32)   # (2, H, W)
         img = np.clip(img, -50.0, 0.0)
@@ -104,7 +111,14 @@ class OilSpillDataset(Dataset):
         return img
 
     def _load_mask(self, mask_path: str) -> np.ndarray:
-        """Load binary mask, normalize to 0.0/1.0."""
+        """
+        Load binary mask and return float32 array of 0.0/1.0 values.
+        - .npy files: already binarized by preprocessing notebook, load directly
+        - .tif files: binarize on the fly (fallback for local training)
+        """
+        if mask_path.endswith('.npy'):
+            return np.load(mask_path)  # already binary float32, shape (H, W)
+
         with rasterio.open(mask_path) as src:
             mask = src.read(1).astype(np.float32)  # (H, W)
         if mask.max() > 1.0:

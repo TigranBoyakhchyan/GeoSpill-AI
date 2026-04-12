@@ -1,6 +1,4 @@
 """
-src/train.py
-------------
 Full training pipeline for SAR oil spill segmentation.
 
 Works with the on-the-fly cropping dataset — no pre-extracted patches needed.
