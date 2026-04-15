@@ -16,8 +16,8 @@ Usage (from Colab notebook):
     pre.run(
         images_dir = '/content/drive/MyDrive/Geo_Spill_Data/images',
         masks_dir  = '/content/drive/MyDrive/Geo_Spill_Data/masks',
-        output_dir = '/content/drive/MyDrive/Geo_Spill_results/npz_cache',
-        stats_file = 'data/train_stats.json',
+        output_dir = '/content/data/npz_cache',
+        stats_file = '/content/data/train_stats.json',
     )
 
 Output:
@@ -28,6 +28,7 @@ Output:
 """
 
 import os
+import gc
 import json
 import argparse
 import numpy as np
@@ -45,6 +46,9 @@ DB_CLIP_MAX =  0.0
 TRAIN_RATIO =  0.70
 VAL_RATIO   =  0.15
 # TEST_RATIO  =  0.15  (remainder)
+
+# How often to force garbage collection (every N files)
+GC_EVERY = 50
 
 
 # ─── FILE DISCOVERY ───────────────────────────────────────────────────────────
@@ -111,6 +115,9 @@ def compute_mean_std(image_paths: list) -> tuple:
     Uses online accumulation so we never load all images into memory at once.
     Stats are computed AFTER clipping to remove extreme outlier values.
 
+    Memory-optimized: uses in-place clip and computes squared sums
+    one band at a time to avoid allocating a full copy of the image.
+
     IMPORTANT: only pass training image paths — never val/test.
     Including val/test would be data leakage.
 
@@ -127,15 +134,24 @@ def compute_mean_std(image_paths: list) -> tuple:
     for i, path in enumerate(image_paths):
         print(f"  [{i+1:4d}/{total}] {os.path.basename(path)}", end="\r")
         try:
-            img = load_image(path)
-            img = np.clip(img, DB_CLIP_MIN, DB_CLIP_MAX)
+            img = load_image(path)                 # (2, H, W) float32
+            np.clip(img, DB_CLIP_MIN, DB_CLIP_MAX, out=img)  # in-place
+
             n = img.shape[1] * img.shape[2]
-            band_sums    += img.reshape(2, -1).sum(axis=1)
-            band_sq_sums += (img.reshape(2, -1) ** 2).sum(axis=1)
-            pixel_count  += n
+            for b in range(2):
+                band_flat = img[b].ravel()         # view, no copy
+                band_sums[b]    += band_flat.sum()
+                band_sq_sums[b] += np.dot(band_flat, band_flat)  # sum of squares without allocating img**2
+            pixel_count += n
+
+            del img, band_flat                     # free immediately
         except Exception as e:
             print(f"\n  SKIPPING {os.path.basename(path)}: {e}")
             skipped += 1
+
+        # Periodic garbage collection to return memory to OS
+        if (i + 1) % GC_EVERY == 0:
+            gc.collect()
 
     print()
 
@@ -160,10 +176,13 @@ def convert_image(src_path: str,
                   mean: np.ndarray,
                   std: np.ndarray) -> bool:
     """
-    Load a SAR image, clip, normalize, and save as compressed .npz.
+    Load a SAR image, clip, normalize, and save as .npz.
 
-    np.savez_compressed automatically appends .npz to dst_stem,
-    so pass the path WITHOUT the .npz extension.
+    Memory-optimized:
+        • clip and normalize are done in-place (no extra copies)
+        • uses np.savez (ZIP_STORED) instead of np.savez_compressed
+          (ZIP_DEFLATED) to avoid zlib buffering the entire array in RAM
+        • file size is ~2× larger on disk, but that is fine for local SSD
 
     The file stores one array under key 'data'.
     Load with: np.load('file.npz')['data']
@@ -172,10 +191,12 @@ def convert_image(src_path: str,
         True on success, False on failure
     """
     try:
-        img = load_image(src_path)
-        img = np.clip(img, DB_CLIP_MIN, DB_CLIP_MAX)
-        img = (img - mean[:, None, None]) / (std[:, None, None] + 1e-6)
-        np.savez_compressed(dst_stem, data=img)
+        img = load_image(src_path)                                   # (2, H, W)
+        np.clip(img, DB_CLIP_MIN, DB_CLIP_MAX, out=img)             # in-place
+        img -= mean[:, None, None]                                   # in-place
+        img /= (std[:, None, None] + 1e-6)                          # in-place
+        np.savez(dst_stem, data=img)                                 # no compression
+        del img
         return True
     except Exception as e:
         print(f"\n  SKIPPING {os.path.basename(src_path)}: {e}")
@@ -184,9 +205,8 @@ def convert_image(src_path: str,
 
 def convert_mask(src_path: str, dst_stem: str) -> bool:
     """
-    Load a binary mask and save as compressed .npz.
+    Load a binary mask and save as .npz.
 
-    np.savez_compressed automatically appends .npz to dst_stem.
     The file stores one array under key 'data'.
     Load with: np.load('file.npz')['data']
 
@@ -195,11 +215,24 @@ def convert_mask(src_path: str, dst_stem: str) -> bool:
     """
     try:
         mask = load_mask(src_path)
-        np.savez_compressed(dst_stem, data=mask)
+        np.savez(dst_stem, data=mask)                                # no compression
+        del mask
         return True
     except Exception as e:
         print(f"\n  SKIPPING {os.path.basename(src_path)}: {e}")
         return False
+
+
+def _get_ram_mb() -> str:
+    """Return current process RSS in MB (Linux only, silent fail)."""
+    try:
+        with open("/proc/self/status") as f:
+            for line in f:
+                if line.startswith("VmRSS:"):
+                    return f"{int(line.split()[1]) / 1024:.0f} MB"
+    except Exception:
+        pass
+    return "N/A"
 
 
 # ─── MAIN PIPELINE ────────────────────────────────────────────────────────────
@@ -265,6 +298,10 @@ def run(images_dir: str,
     print(f"  Band 0 (VV): mean={mean[0]:.4f}, std={std[0]:.4f}")
     print(f"  Band 1 (VH): mean={mean[1]:.4f}, std={std[1]:.4f}")
 
+    # Free any memory held by the stats pass before conversion begins
+    gc.collect()
+    print(f"  RAM after stats: {_get_ram_mb()}")
+
     # ── 4. Create output directories ──────────────────────────────
     img_out_dir  = os.path.join(output_dir, "images")
     mask_out_dir = os.path.join(output_dir, "masks")
@@ -286,8 +323,6 @@ def run(images_dir: str,
         img_stem = os.path.join(img_out_dir,  stem)   # without .npz
         msk_stem = os.path.join(mask_out_dir, stem)   # without .npz
 
-        print(f"  [{i+1:4d}/{total}] {stem}", end="\r")
-
         # Skip if already converted — allows safe resume after interruption
         if (os.path.exists(img_stem  + ".npz") and
                 os.path.exists(msk_stem + ".npz")):
@@ -302,7 +337,15 @@ def run(images_dir: str,
         else:
             skip += 1
 
+        # Periodic GC + progress with RAM usage
+        if (i + 1) % GC_EVERY == 0:
+            gc.collect()
+            print(f"  [{i+1:4d}/{total}] {stem}  (RAM: {_get_ram_mb()})")
+        else:
+            print(f"  [{i+1:4d}/{total}] {stem}", end="\r")
+
     print(f"\nConversion : {ok} new, {already} already existed, {skip} failed")
+    print(f"  Final RAM: {_get_ram_mb()}")
 
     # ── 6. Build split path lists ─────────────────────────────────
     def npz_path(tif_path: str, subdir: str) -> str:

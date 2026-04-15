@@ -6,7 +6,7 @@ LocalTrainingDataset/
 checkpoints/
 eda.py
 eda_output/
-data/patches/
+data
 *.tif
 *.tiff
 *.pth
