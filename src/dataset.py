@@ -7,26 +7,8 @@ Loads preprocessed .npz files produced by preprocess.py and returns
 (image_tensor, mask_tensor) pairs ready for DataLoader consumption.
 
 Expected .npz layout (produced by preprocess.py):
-    images/<stem>.npz  — key 'data', shape (2, H, W), float32, already normalized
-    masks/<stem>.npz   — key 'data', shape (H, W),    float32, values 0.0 / 1.0
-
-Typical usage:
-    import json
-    from torch.utils.data import DataLoader
-    from src.dataset import SARDataset
-
-    stats = json.load(open("data/train_stats.json"))
-    splits = stats["splits"]
-
-    train_ds = SARDataset(splits["train"], splits["masks"],
-                          augment=True)
-    val_ds   = SARDataset(splits["val"],   splits["masks"])
-    test_ds  = SARDataset(splits["test"],  splits["masks"])
-
-    train_loader = DataLoader(train_ds, batch_size=8, shuffle=True,
-                              num_workers=4, pin_memory=True)
-    val_loader   = DataLoader(val_ds,   batch_size=8, shuffle=False,
-                              num_workers=4, pin_memory=True)
+    images/<stem>.npz  — key 'data', shape (2, H, W), dtype float32, normalized
+    masks/<stem>.npz   — key 'data', shape (H, W),    dtype uint8,   0 or 1
 """
 
 import os
@@ -38,8 +20,6 @@ import torchvision.transforms.functional as TF
 import random
 
 
-# ─── DATASET ──────────────────────────────────────────────────────────────────
-
 class SARDataset(Dataset):
     """
     PyTorch Dataset for SAR oil spill segmentation.
@@ -48,22 +28,8 @@ class SARDataset(Dataset):
         image : FloatTensor of shape (2, H, W) — VV and VH bands, normalized
         mask  : FloatTensor of shape (1, H, W) — 0.0 = water, 1.0 = oil spill
 
-    The mask is unsqueezed to (1, H, W) so it can be directly passed to
-    loss functions like BCEWithLogitsLoss without extra reshape calls.
-
-    Args:
-        image_paths (list[str]):
-            Ordered list of .npz image paths (from stats["splits"]["train"] etc.)
-        mask_lookup (dict[str, str]):
-            Maps each image .npz path to its corresponding mask .npz path
-            (stats["splits"]["masks"]).
-        augment (bool):
-            If True, applies random geometric augmentations (flips + 90° rotations).
-            Should be True only for training splits.
-        patch_size (int | None):
-            If set, a random (patch_size × patch_size) crop is extracted each time.
-            Useful when images are large and GPU memory is limited.
-            If None, full images are returned as-is.
+    Mask arrays are stored on disk as uint8 (to save storage) but returned
+    as float32 tensors so they can be directly passed to BCEWithLogitsLoss.
     """
 
     def __init__(self,
@@ -72,7 +38,6 @@ class SARDataset(Dataset):
                  augment:      bool = False,
                  patch_size:   int  = None):
 
-        # Validate that every image path has a corresponding mask
         missing = [p for p in image_paths if p not in mask_lookup]
         if missing:
             raise KeyError(
@@ -85,16 +50,12 @@ class SARDataset(Dataset):
         self.augment      = augment
         self.patch_size   = patch_size
 
-    # ── Dunder helpers ────────────────────────────────────────────────────────
-
     def __len__(self) -> int:
         return len(self.image_paths)
 
     def __repr__(self) -> str:
         return (f"SARDataset(n={len(self)}, augment={self.augment}, "
                 f"patch_size={self.patch_size})")
-
-    # ── Core loading ──────────────────────────────────────────────────────────
 
     def _load_npz(self, path: str) -> np.ndarray:
         """Load the 'data' array from a compressed .npz file."""
@@ -104,8 +65,6 @@ class SARDataset(Dataset):
 
     def __getitem__(self, idx: int) -> tuple:
         """
-        Return a single (image, mask) pair as float32 tensors.
-
         Returns:
             image : FloatTensor (2, H, W)
             mask  : FloatTensor (1, H, W)
@@ -113,19 +72,19 @@ class SARDataset(Dataset):
         img_path  = self.image_paths[idx]
         mask_path = self.mask_lookup[img_path]
 
-        # Load arrays — images are pre-normalized by preprocess.py
-        image = self._load_npz(img_path)   # (2, H, W) float32
-        mask  = self._load_npz(mask_path)  # (H, W)    float32
+        image = self._load_npz(img_path)    # float32 on disk
+        mask  = self._load_npz(mask_path)   # uint8 on disk
+
+        # Cast mask to float32 for BCEWithLogitsLoss / FocalDiceLoss
+        mask = mask.astype(np.float32, copy=False)
 
         # Convert to tensors
-        image = torch.from_numpy(image)            # (2, H, W)
-        mask  = torch.from_numpy(mask).unsqueeze(0) # (1, H, W)
+        image = torch.from_numpy(image)               # (2, H, W) float32
+        mask  = torch.from_numpy(mask).unsqueeze(0)   # (1, H, W) float32
 
-        # Optional random crop (applied identically to image and mask)
         if self.patch_size is not None:
             image, mask = self._random_crop(image, mask)
 
-        # Optional augmentation (applied identically to image and mask)
         if self.augment:
             image, mask = self._augment(image, mask)
 
@@ -138,14 +97,12 @@ class SARDataset(Dataset):
                      mask:  torch.Tensor) -> tuple:
         """
         Extract a random (patch_size × patch_size) crop.
-        The same region is cropped from both image and mask.
         Falls back to center crop if the image is smaller than patch_size.
         """
         _, H, W = image.shape
         ps = self.patch_size
 
         if H < ps or W < ps:
-            # Center crop — handles edge case of small images
             top  = max(0, (H - ps) // 2)
             left = max(0, (W - ps) // 2)
         else:
@@ -160,28 +117,22 @@ class SARDataset(Dataset):
                  image: torch.Tensor,
                  mask:  torch.Tensor) -> tuple:
         """
-        Apply random geometric augmentations — SAR-safe (no color jitter).
-
-        Transforms applied identically to image and mask:
+        SAR-safe geometric augmentations:
             • Random horizontal flip   (p = 0.5)
             • Random vertical flip     (p = 0.5)
             • Random 90° rotation      (0 / 90 / 180 / 270°, each p = 0.25)
 
-        Intensity / color augmentations are intentionally excluded because
-        the images are already normalized radar backscatter values; altering
-        their distribution would corrupt the physical signal.
+        No intensity / color augmentations — images are normalized radar
+        backscatter; altering their distribution would corrupt the signal.
         """
-        # Horizontal flip
         if random.random() < 0.5:
             image = TF.hflip(image)
             mask  = TF.hflip(mask)
 
-        # Vertical flip
         if random.random() < 0.5:
             image = TF.vflip(image)
             mask  = TF.vflip(mask)
 
-        # 90° rotation (k ∈ {0, 1, 2, 3})
         k = random.randint(0, 3)
         if k:
             image = torch.rot90(image, k, dims=[1, 2])
@@ -195,19 +146,10 @@ class SARDataset(Dataset):
 def build_datasets(stats_file: str,
                    patch_size: int = None) -> dict:
     """
-    Convenience factory: load train_stats.json and return all three splits.
-
-    Args:
-        stats_file (str): Path to train_stats.json written by preprocess.py.
-        patch_size (int | None): Forwarded to SARDataset. Crops random patches
-            when set; returns full images otherwise.
+    Load train_stats.json and return all three splits.
 
     Returns:
         dict with keys 'train', 'val', 'test' → SARDataset instances.
-
-    Example:
-        datasets = build_datasets("data/train_stats.json", patch_size=256)
-        train_loader = DataLoader(datasets["train"], batch_size=8, shuffle=True)
     """
     with open(stats_file) as f:
         stats = json.load(f)
@@ -221,7 +163,7 @@ def build_datasets(stats_file: str,
         "val":   SARDataset(splits["val"],  mask_lookup,
                             augment=False, patch_size=patch_size),
         "test":  SARDataset(splits["test"], mask_lookup,
-                            augment=False, patch_size=None),  # full images at test time
+                            augment=False, patch_size=None),  # full images
     }
 
 
@@ -230,25 +172,7 @@ def build_loaders(stats_file:  str,
                   patch_size:  int = None,
                   num_workers: int = 4,
                   pin_memory:  bool = True) -> dict:
-    """
-    Convenience factory: build datasets AND wrap them in DataLoaders.
-
-    Args:
-        stats_file (str):  Path to train_stats.json.
-        batch_size (int):  Batch size for train and val loaders.
-                           Test loader always uses batch_size=1 for full-image eval.
-        patch_size (int):  Random crop size (None = full images).
-        num_workers (int): Workers per DataLoader.
-        pin_memory (bool): Pin memory for faster GPU transfer.
-
-    Returns:
-        dict with keys 'train', 'val', 'test' → DataLoader instances.
-
-    Example:
-        loaders = build_loaders("data/train_stats.json", batch_size=8, patch_size=256)
-        for images, masks in loaders["train"]:
-            ...  # images: (B, 2, H, W), masks: (B, 1, H, W)
-    """
+    """Build datasets AND wrap them in DataLoaders."""
     datasets = build_datasets(stats_file, patch_size=patch_size)
 
     return {
@@ -258,7 +182,7 @@ def build_loaders(stats_file:  str,
             shuffle     = True,
             num_workers = num_workers,
             pin_memory  = pin_memory,
-            drop_last   = True,   # keeps batch sizes uniform during training
+            drop_last   = True,
         ),
         "val": DataLoader(
             datasets["val"],
@@ -269,7 +193,7 @@ def build_loaders(stats_file:  str,
         ),
         "test": DataLoader(
             datasets["test"],
-            batch_size  = 1,      # full-image inference, one at a time
+            batch_size  = 1,
             shuffle     = False,
             num_workers = num_workers,
             pin_memory  = pin_memory,
