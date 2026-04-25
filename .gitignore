@@ -12,3 +12,4 @@ data
 *.pth
 *.egg-info/
 .DS_Store
+models/

@@ -478,6 +478,12 @@ if img.ndim == 2:
 
 n_bands, H, W = img.shape
 
+# After reading the image, check if values look like linear power
+# (mostly positive, range 0-5ish) vs decibels (mostly negative, range -50 to 0)
+if img[0].mean() > 0 and img[0].max() < 10:
+    # Likely linear power — convert to dB
+    st.info("Detected linear-scale data — converting to decibels (dB = 10·log₁₀).")
+    img = np.where(img > 0, 10.0 * np.log10(img + 1e-10), -50.0).astype(np.float32)
 # ── Image Properties ──────────────────────────────────────────────────────────
 
 st.markdown('<div class="section-header">02 — Image Properties</div>', unsafe_allow_html=True)
