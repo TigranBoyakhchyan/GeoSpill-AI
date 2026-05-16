@@ -1,6 +1,4 @@
 """
-src/preprocess.py
------------------
 Converts SAR GeoTIFF images and masks to compressed .npz format,
 and computes normalization statistics (mean/std) from the training set.
 

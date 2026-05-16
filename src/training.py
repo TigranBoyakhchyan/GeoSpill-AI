@@ -1,6 +1,4 @@
 """
-src/training.py
----------------
 Training script for SAR oil spill segmentation.
 
 Architecture : U-Net with pretrained ResNet34 encoder
