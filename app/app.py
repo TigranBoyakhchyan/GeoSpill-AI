@@ -72,8 +72,8 @@ html,body,[class*="css"]{font-family:'Outfit',sans-serif;color:var(--tx)}
 
 /* Button styled to match the "Sentinel-1 SAR Analysis" tag */
 .stButton > button {
-    background-color: var(--t) !important; /* same as .hero-tag */
-    border-color: var(--t) !important;
+    background-color: #2bb597 !important; /* same as .hero-tag */
+    border-color: #2bb597 !important;
     color: #060d18 !important;
     border-radius: 10px !important;
     padding: .6rem 1rem !important;
@@ -145,12 +145,12 @@ def process_single_file(file_bytes, filename, model, stats, has_model,
         std = np.array(stats["std"], dtype=np.float32)
         pb = progress_container.progress(0.0, text=f"Processing {filename}...")
         def _cb(d, t): pb.progress(d/t, text=f"{filename}: tile {d}/{t}")
-        mask = predict_sliding(img, model, mean, std, patch_size=patch_size,
+        mask, prob_map = predict_sliding(img, model, mean, std, patch_size=patch_size,
                                stride=stride, threshold=threshold, progress_cb=_cb)
         pb.empty()
         mode = "U-Net"
     else:
-        mask = predict_demo(img, threshold_pct)
+        mask, prob_map = predict_demo(img, threshold_pct)
         mode = "Demo"
 
     # Post-processing
@@ -163,7 +163,43 @@ def process_single_file(file_bytes, filename, model, stats, has_model,
     # Render preview
     preview_png = render_preview(img, mask)
 
-    # Mask downloads
+    # Render confidence heatmap
+    from matplotlib.colors import LinearSegmentedColormap
+    heatmap_colors = [
+        (0.0,  "#060d18"),  # background — no confidence
+        (0.15, "#0c2341"),  # very low — deep blue
+        (0.35, "#164e6e"),  # low — teal hint
+        (0.50, "#2dd4bf"),  # threshold zone — teal
+        (0.65, "#fbbf24"),  # above threshold — amber
+        (0.80, "#f87171"),  # confident — red
+        (1.0,  "#ff2222"),  # very confident — bright red
+    ]
+    positions = [c[0] for c in heatmap_colors]
+    colors_hex = [c[1] for c in heatmap_colors]
+    # Convert hex to RGB tuples
+    colors_rgb = []
+    for h in colors_hex:
+        h = h.lstrip("#")
+        colors_rgb.append(tuple(int(h[i:i+2], 16) / 255.0 for i in (0, 2, 4)))
+    oil_heatmap_cmap = LinearSegmentedColormap.from_list("oil_conf", list(zip(positions, colors_rgb)))
+
+    fig_h, ax_h = plt.subplots(1, 1, figsize=(15, 5), facecolor="#060d18")
+    ax_h.set_facecolor("#060d18")
+    ax_h.axis("off")
+    im = ax_h.imshow(prob_map, cmap=oil_heatmap_cmap, vmin=0, vmax=1)
+    # Threshold line in colorbar
+    cbar = fig_h.colorbar(im, ax=ax_h, fraction=0.025, pad=0.02)
+    cbar.set_label("Oil Probability", color="#94a3b8", fontfamily="monospace", fontsize=9)
+    cbar.ax.tick_params(colors="#64748b", labelsize=8)
+    cbar.ax.axhline(y=threshold, color="#ffffff", linewidth=1.5, linestyle="--")
+    cbar.ax.text(1.5, threshold, f" threshold ({threshold})", color="#ffffff",
+                 fontsize=7, fontfamily="monospace", va="center",
+                 transform=cbar.ax.get_yaxis_transform())
+    plt.tight_layout()
+    buf_h = io.BytesIO()
+    fig_h.savefig(buf_h, format="png", dpi=110, facecolor="#060d18", bbox_inches="tight")
+    plt.close(fig_h)
+    heatmap_png = buf_h.getvalue()
     mi = Image.fromarray((mask * 255).astype(np.uint8), mode="L")
     buf = io.BytesIO(); mi.save(buf, format="PNG"); mask_png = buf.getvalue()
 
@@ -184,8 +220,8 @@ def process_single_file(file_bytes, filename, model, stats, has_model,
         "oil_pixels": area_info["oil_pixels"],
         "oil_pct": 100.0 * area_info["oil_pixels"] / (H * W),
         "area_info": area_info, "coords": coords,
-        "preview_png": preview_png, "mask_png": mask_png,
-        "geotiff_bytes": geotiff_bytes,
+        "preview_png": preview_png, "heatmap_png": heatmap_png,
+        "mask_png": mask_png, "geotiff_bytes": geotiff_bytes,
     }
 
 
@@ -374,6 +410,19 @@ for idx, r in enumerate(results):
 
         # Preview + download buttons underneath
         st.image(r["preview_png"], width="stretch")
+
+        # Confidence heatmap
+        show_heatmap = st.checkbox("Show confidence heatmap", value=False,
+                                    key=f"hm_{idx}")
+        if show_heatmap:
+            st.image(r["heatmap_png"], width="stretch")
+            st.markdown(
+                '<div style="font-family:JetBrains Mono,monospace;font-size:.7rem;'
+                'color:#475569;margin-top:.3rem">'
+                'Brighter = higher oil probability. '
+                'White dashed line on colorbar = detection threshold. '
+                'Pixels above the threshold become the binary mask.</div>',
+                unsafe_allow_html=True)
         
         d1, d2, d3 = st.columns(3)
         with d1:

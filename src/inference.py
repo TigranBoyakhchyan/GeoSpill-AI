@@ -79,14 +79,19 @@ def predict_sliding(img, model, mean, std, patch_size=256, stride=128,
                 if progress_cb:
                     progress_cb(done, total)
     avg_prob = pred_sum / np.maximum(pred_count, 1e-6)
-    return (avg_prob > threshold).astype(np.float32)
+    mask = (avg_prob > threshold).astype(np.float32)
+    return mask, avg_prob
 
 
 def predict_demo(img, threshold_pct=8):
     vv = img[0] if img.ndim == 3 else img
     vv_clipped = np.clip(vv, DB_CLIP_MIN, DB_CLIP_MAX)
     vv_norm = (vv_clipped - vv_clipped.min()) / (vv_clipped.max() - vv_clipped.min() + 1e-6)
-    return (vv_norm < np.percentile(vv_norm, threshold_pct)).astype(np.float32)
+    thresh_val = np.percentile(vv_norm, threshold_pct)
+    # Invert so darker = higher probability (matching model convention)
+    prob = 1.0 - vv_norm
+    mask = (vv_norm < thresh_val).astype(np.float32)
+    return mask, prob.astype(np.float32)
 
 
 def filter_small_regions(mask, min_pixels=500):
