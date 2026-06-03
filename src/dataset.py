@@ -72,8 +72,8 @@ class SARDataset(Dataset):
         img_path  = self.image_paths[idx]
         mask_path = self.mask_lookup[img_path]
 
-        image = self._load_npz(img_path)    # float32 on disk
-        mask  = self._load_npz(mask_path)   # uint8 on disk
+        image = self._load_npz(img_path).astype(np.float32, copy=False)
+        mask  = self._load_npz(mask_path).astype(np.float32, copy=False)
 
         # Cast mask to float32 for BCEWithLogitsLoss / FocalDiceLoss
         mask = mask.astype(np.float32, copy=False)

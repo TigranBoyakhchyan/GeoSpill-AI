@@ -76,7 +76,7 @@ class DiceLoss(nn.Module):
 
 
 class FocalDiceLoss(nn.Module):
-    def __init__(self, alpha=0.25, gamma=2.0, dice_weight=1.0, focal_weight=1.0):
+    def __init__(self, alpha=0.5, gamma=2.0, dice_weight=1.0, focal_weight=1.0):
         super().__init__()
         self.gamma        = gamma
         self.alpha        = alpha
@@ -317,6 +317,8 @@ def train(args):
         csv_writer.writeheader()
 
     # ── Training loop ─────────────────────────────────────────────
+    patience = 10
+    epochs_without_improvement = 0
     for epoch in range(start_epoch, args.epochs + 1):
         t0 = time.time()
 
@@ -335,6 +337,7 @@ def train(args):
         if val_metrics["iou"] > best_val_iou:
             best_val_iou  = val_metrics["iou"]
             best_val_dice = val_metrics["dice"]
+            epochs_without_improvement = 0
             torch.save({
                 "epoch":           epoch,
                 "model_state":     model.state_dict(),
@@ -346,6 +349,12 @@ def train(args):
             }, ckpt_path)
             print(f"  New best — IoU {best_val_iou:.4f}, "
                   f"Dice {best_val_dice:.4f} -> saved to {ckpt_path}")
+        else:
+            epochs_without_improvement += 1
+            print(f"  No improvement for {epochs_without_improvement}/{patience} epochs")
+            if epochs_without_improvement >= patience:
+                print(f"\n  Early stopping — no improvement for {patience} epochs.")
+                break
 
         # ── CSV row ───────────────────────────────────────────────
         csv_writer.writerow({

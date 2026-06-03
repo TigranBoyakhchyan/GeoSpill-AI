@@ -153,7 +153,7 @@ def convert_image(src_path: str,
         np.clip(img, DB_CLIP_MIN, DB_CLIP_MAX, out=img)
         img -= mean[:, None, None]
         img /= (std[:, None, None] + 1e-6)
-        np.savez_compressed(dst_stem, data=img)
+        np.savez_compressed(dst_stem, data=img.astype(np.float16))
         del img
         return True
     except Exception as e:
