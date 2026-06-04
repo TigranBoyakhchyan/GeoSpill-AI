@@ -252,15 +252,22 @@ with st.sidebar:
     if has_model:
         dev = "GPU" if next(model.parameters()).is_cuda else "CPU"
         st.markdown(f'<span class="badge b-ok">✓ Model ({dev})</span>', unsafe_allow_html=True)
+
         threshold = st.slider("Detection threshold", 0.1, 0.9, 0.75, 0.05)
-        patch_size = st.selectbox("Patch size", [256, 512], index=0)
-        stride = st.selectbox("Stride", [patch_size // 2, patch_size], index=0)
         threshold_pct = 8
+
+        with st.expander("Advanced settings", expanded=False):
+            patch_size = st.selectbox("Patch size", [256, 512], index=0)
+            stride = st.selectbox("Stride", [patch_size // 2, patch_size], index=0)
+            min_area = st.slider("Min spill size (pixels)", 100, 2000, 500, 100,
+                                 help="Connected regions smaller than this are removed as noise.",
+                                 key="min_area_model")
     else:
         st.markdown('<span class="badge b-dm">⚡ Demo</span>', unsafe_allow_html=True)
         st.caption(err)
         threshold_pct = st.slider("Oil sensitivity (%ile)", 2, 20, 8, 1)
         threshold = 0.5; patch_size = 256; stride = 128
+        min_area = 500
 
     min_area = st.slider("Min spill size (pixels)", 100, 2000, 500, 100,
                          help="Connected regions smaller than this are removed as noise.")
