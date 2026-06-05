@@ -28,7 +28,7 @@ SPILL_COLORS = [("#f87171","Red"),("#fb923c","Orange"),("#fbbf24","Amber"),
     ("#a78bfa","Purple"),("#34d399","Emerald"),("#f472b6","Pink"),
     ("#38bdf8","Sky"),("#e879f9","Fuchsia")]
 MAP_MAX_MARKERS = 3000
-DEFAULT_MODEL_PATH = "models/best_model_20260416_145208.pt"
+DEFAULT_MODEL_PATH = "models/best_model_20260604_091953.pt"
 DEFAULT_STATS_PATH = "data/train_stats.json"
 
 st.set_page_config(page_title="GeoSpill AI", page_icon="🛰️",
