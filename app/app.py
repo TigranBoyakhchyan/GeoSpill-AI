@@ -268,9 +268,6 @@ with st.sidebar:
         threshold_pct = st.slider("Oil sensitivity (%ile)", 2, 20, 8, 1)
         threshold = 0.5; patch_size = 256; stride = 128
         min_area = 500
-
-    min_area = st.slider("Min spill size (pixels)", 100, 2000, 500, 100,
-                         help="Connected regions smaller than this are removed as noise.")
     st.markdown("---")
     proximity_radius = st.slider("Coast search radius (km)", 50, 500, 200, 25)
 
